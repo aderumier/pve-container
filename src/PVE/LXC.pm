@@ -848,6 +848,9 @@ sub destroy_lxc_container {
     rmdir "/var/lib/lxc/$vmid/rootfs";
     unlink "/var/lib/lxc/$vmid/config";
     rmdir "/var/lib/lxc/$vmid";
+
+    PVE::LXC::Config->delete_ipam_ifaces($conf);
+
     if (defined $replacement_conf) {
 	PVE::LXC::Config->write_config($vmid, $replacement_conf);
     } else {

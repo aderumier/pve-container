@@ -12,6 +12,14 @@ use PVE::INotify;
 use PVE::JSONSchema qw(get_standard_option);
 use PVE::Tools;
 
+my $have_sdn;
+eval {
+    require PVE::Network::SDN::Vnets;
+    require PVE::Network::SDN::Subnets;
+    $have_sdn = 1;
+};
+
+
 use base qw(PVE::AbstractConfig);
 
 use constant {FIFREEZE => 0xc0045877,
@@ -1043,6 +1051,10 @@ sub update_pct_config {
 	    $class->check_protection($conf, "can't remove CT $vmid drive '$opt'");
 	} elsif ($opt eq 'unprivileged') {
 	    die "unable to delete read-only option: '$opt'\n";
+	} elsif ($opt =~ m/^net(\d+)$/) {
+	    my $netid = $1;
+	    my $oldnet = $class->parse_lxc_network($conf->{$opt});
+	    delete_net_ip($conf->{hostname}, $oldnet, "vm:$vmid net:$netid");
 	}
 	$class->add_to_pending_delete($conf, $opt);
     }
@@ -1070,7 +1082,24 @@ sub update_pct_config {
 	    $value = PVE::LXC::verify_searchdomain_list($value);
 	} elsif ($opt eq 'unprivileged') {
 	    die "unable to modify read-only option: '$opt'\n";
+	} elsif ($opt =~ m/^net(\d+)$/) {
+		my $netid = $1;
+		my $net = $class->parse_lxc_network($value);
+		my $oldnet = $class->parse_lxc_network($conf->{$opt});
+		my $hostname = $param->{hostname} ? $param->{hostname} : $conf->{hostname};
+		update_net_ip($net, $oldnet, $hostname, $hostname, "vm:$vmid net:$netid");
+		$value = $class->print_lxc_network($net);
+	} elsif ($opt eq 'hostname') {
+	    #if hostname change, update ipam + dns for each ip
+	    foreach my $netopt (sort keys %$conf) {
+	        next if $netopt !~ m/^net(\d+)$/;
+		my $netid = $1;
+		my $net = $class->parse_lxc_network($conf->{$netopt});
+		my $oldnet = $class->parse_lxc_network($conf->{$netopt});
+		update_net_ip($net, $oldnet, $value, $conf->{hostname}, "vm:$vmid net:$netid");
+	    }
 	}
+
 	$conf->{pending}->{$opt} = $value;
 	$class->remove_from_pending_delete($conf, $opt);
     }
@@ -1660,6 +1689,145 @@ sub get_backup_volumes {
     PVE::LXC::Config->foreach_volume($conf, $test_mountpoint);
 
     return $return_volumes;
+}
+
+sub delete_ipam_ifaces {
+    my ($class, $conf) = @_;
+
+    return if !$have_sdn;
+
+    foreach my $opt (sort keys %$conf) {
+	next if $opt !~ m/^net(\d+)$/;
+	my $netid = $1;
+	my $net = $class->parse_lxc_network($conf->{$opt});
+	my $bridge = $net->{bridge};
+	my $hostname = $conf->{hostname};
+	my $description = '';
+
+	my $subnets = PVE::Network::SDN::Vnets::get_subnets($bridge);
+	next if !keys %{$subnets};
+
+	eval {
+	    PVE::Network::SDN::Vnets::del_cidr($bridge, $net->{ip}, $hostname, $description) if $net->{ip} && $net->{ip} ne 'dhcp' && $net->{ip} ne 'manual';
+	    PVE::Network::SDN::Vnets::del_cidr($bridge, $net->{ip6}, $hostname, $description) if $net->{ip6} && $net->{ip6} ne 'dhcp' && $net->{ip6} ne 'manual' && $net->{ip6} ne 'auto';
+	};
+	if ($@) {
+	    warn $@;
+	}
+    }
+}
+
+sub update_net_ip {
+    my ($net, $oldnet, $hostname, $oldhostname, $description) = @_;
+
+    return if !$have_sdn;
+
+    my $oldbridge = $oldnet->{bridge};
+    my $bridge = $net->{bridge};
+    my $mac = $net->{hwaddr};
+
+    my $subnets = PVE::Network::SDN::Vnets::get_subnets($bridge);
+
+    return if !keys %{$subnets};
+
+    #add new ip first
+    my $new_ipv4_allocated = undef;
+    eval {
+	if (!$net->{ip}) {
+	    $net->{ip} = PVE::Network::SDN::Vnets::get_next_free_cidr($bridge, $hostname, $mac, $description);
+	    $new_ipv4_allocated = 1;
+	} elsif ($net->{ip} ne 'dhcp' && $net->{ip} ne 'manual') {
+
+	    if ($oldnet->{ip} && $net->{ip} eq $oldnet->{ip}) {
+		#update ip attributes if no ip address change
+		PVE::Network::SDN::Vnets::update_cidr($bridge, $net->{ip}, $hostname, $oldhostname, $mac, $description);
+	    } else {
+		PVE::Network::SDN::Vnets::add_cidr($bridge, $net->{ip}, $hostname, $mac, $description) if !$oldnet->{ip} || $net->{ip} ne $oldnet->{ip};
+		$new_ipv4_allocated = 1;
+	    }
+	}
+    };
+    if ($@) {
+	die $@;
+    }
+
+    #then add ip6
+    eval {
+	if (!$net->{ip6}) {
+	    $net->{ip6} = PVE::Network::SDN::Vnets::get_next_free_cidr($bridge, $hostname, $mac, $description, 6);
+	} elsif ($net->{ip6} ne 'dhcp' && $net->{ip6} ne 'manual' && $net->{ip6} ne 'auto') {
+	    if ($oldnet->{ip6} && $net->{ip6} eq $oldnet->{ip6}) {
+		#update ipv6 attributes if no ip address change
+		PVE::Network::SDN::Vnets::update_cidr($bridge, $net->{ip6}, $hostname, $oldhostname, $mac, $description);
+	    } else {
+		PVE::Network::SDN::Vnets::add_cidr($bridge, $net->{ip6}, $hostname, $mac, $description) if !$oldnet->{ip6} || $net->{ip6} ne $oldnet->{ip6};
+	    }
+	}
+    };
+    if ($@) {
+	my $err = $@;
+	#if error, delete previously added ipv4
+	if ($new_ipv4_allocated) {
+	    eval {
+		PVE::Network::SDN::Vnets::del_cidr($bridge, $net->{ip}, $hostname, $description);
+	    };
+	}
+	die $err;
+    }
+
+    #delete old ip
+    if ($oldnet->{ip} && $oldnet->{ip} ne 'dhcp' && $oldnet->{ip} ne 'manual') {
+	my $deletebridge = $oldbridge ne $bridge ? $oldbridge : $bridge;
+	eval {
+	    PVE::Network::SDN::Vnets::del_cidr($deletebridge, $oldnet->{ip}, $hostname, $description) if !$net->{ip} || $net->{ip} ne $oldnet->{ip};
+	};
+	warn $@ if $@;
+    }
+
+    #delete old ip6
+    if ($oldnet->{ip6} && $oldnet->{ip6} ne 'dhcp' && $oldnet->{ip6} ne 'manual' && $net->{ip6} ne 'auto') {
+	my $deletebridge = $oldbridge ne $bridge ? $oldbridge : $bridge;
+	eval {
+	    PVE::Network::SDN::Vnets::del_cidr($deletebridge, $oldnet->{ip6}, $hostname) if !$net->{ip6} || $net->{ip6} ne $oldnet->{ip6};
+	};
+	warn $@ if $@;
+    }
+
+    #update gateway
+    if ($net->{ip} && $net->{ip} ne 'dhcp' && $net->{ip} ne 'manual') {
+	my ($ip, $mask) = split(/\//, $net->{ip});
+	my ($subnetidv4, $subnetv4) = PVE::Network::SDN::Subnets::find_ip_subnet($ip, $mask, $subnets);
+	$net->{gw} = $subnetv4->{gateway} if $subnetv4->{gateway};
+    }
+
+    if ($net->{ip6} && $net->{ip6} ne 'dhcp' && $net->{ip6} ne 'manual' && $net->{ip6} ne 'auto') {
+	my ($ip6, $mask6) = split(/\//, $net->{ip6});
+	my ($subnetidv6, $subnetv6) = PVE::Network::SDN::Subnets::find_ip_subnet($ip6, $mask6, $subnets);
+	$net->{gw6} = $subnetv6->{gateway} if $subnetv6->{gateway};
+    }
+
+}
+
+sub delete_net_ip {
+    my ($hostname, $net, $description) = @_;
+
+    return if !$have_sdn;
+
+    my $bridge = $net->{bridge};
+    my $subnets = PVE::Network::SDN::Vnets::get_subnets($bridge);
+    return if !keys %{$subnets};
+
+    if ($net->{ip6} && ($net->{ip6} eq 'auto' || $net->{ip6} eq 'manual' || $net->{ip6} eq 'dhcp')) {
+	eval {
+	    PVE::Network::SDN::Vnets::del_cidr($bridge, $net->{ip6}, $hostname, $description);
+	};
+	warn $@ if $@;
+    } elsif ($net->{ip} && $net->{ip} ne 'dhcp' && $net->{ip} ne 'manual') {
+	eval {
+	    PVE::Network::SDN::Vnets::del_cidr($bridge, $net->{ip}, $hostname, $description);
+	};
+	warn $@ if $@;
+    }
 }
 
 1;
